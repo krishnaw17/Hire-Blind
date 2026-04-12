@@ -50,13 +50,11 @@ export default function App() {
             setUserRole(data.role);
           } else {
             console.error('Verify endpoint returned:', response.status);
-            // Default to recruiter if verify fails but user is authenticated
-            setUserRole('recruiter');
+            setUserRole(null);
           }
         } catch (error) {
           console.error('Failed to fetch user role:', error);
-          // Default to recruiter if backend is unreachable
-          setUserRole('recruiter');
+          setUserRole(null);
         }
       } else {
         setUser(null);

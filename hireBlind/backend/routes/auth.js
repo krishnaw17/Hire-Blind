@@ -112,36 +112,39 @@ router.get('/verify', async (req, res) => {
 
     const decodedToken = await auth.verifyIdToken(token);
 
-    // Known admin emails
-    const adminEmails = ['admin@hireblind.com'];
+    // Hardcoded admin emails — only used as fallback when no Firestore doc exists
+    const adminEmails = ['admin@hireblind.com', 'krishnawadhwa2@gmail.com'];
 
-    let role = adminEmails.includes(decodedToken.email) ? 'admin' : 'recruiter';
+    let role = null;
 
-    // Try to read/create user doc in Firestore
+    // Firestore is the single source of truth for roles
     try {
       const userDocRef = db.collection('users').doc(decodedToken.uid);
       const userDoc = await userDocRef.get();
-      let userData = userDoc.data();
+      const userData = userDoc.data();
 
-      if (!userData) {
-        userData = {
+      if (userData) {
+        role = userData.role;
+
+        // Auto-correct hardcoded admin emails if stored with wrong role
+        if (adminEmails.includes(decodedToken.email) && role !== 'admin') {
+          role = 'admin';
+          await userDocRef.update({ role: 'admin' });
+          console.log(`Corrected role to admin for ${decodedToken.email}`);
+        }
+      } else {
+        // No doc yet — auto-create with email-based fallback
+        role = adminEmails.includes(decodedToken.email) ? 'admin' : 'recruiter';
+        await userDocRef.set({
           email: decodedToken.email,
           role,
           createdAt: new Date().toISOString(),
-        };
-        await userDocRef.set(userData);
+        });
         console.log(`Auto-created user doc for ${decodedToken.email} with role: ${role}`);
-      } else {
-        // Fix role if admin email was previously saved with wrong role
-        if (adminEmails.includes(decodedToken.email) && userData.role !== 'admin') {
-          await userDocRef.update({ role: 'admin' });
-          console.log(`Corrected role to admin for ${decodedToken.email}`);
-        } else {
-          role = userData.role;
-        }
       }
     } catch (firestoreError) {
-      // Firestore not set up yet - fall back to email-based role
+      // Firestore unavailable — fall back to email-based role
+      role = adminEmails.includes(decodedToken.email) ? 'admin' : 'recruiter';
       console.warn('Firestore unavailable, using email-based role:', firestoreError.message);
     }
 

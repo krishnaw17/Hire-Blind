@@ -64,10 +64,13 @@ router.post('/anonymise', async (req, res) => {
     );
 
     // Store anonymised resumes
+    // NOTE: Firestore rejects arrays nested inside arrays, so we
+    // stringify removedFields and store the count as a flat number.
     const anonymisedData = anonymisedResults.map((result, index) => ({
       originalId: result.resumeId || `resume_${index}`,
       anonymisedText: result.anonymisedText || '',
-      removedFields: result.removedFields || [],
+      removedFields: JSON.stringify(result.removedFields || []),
+      removedCount: (result.removedFields || []).length,
       status: result.status || 'pending',
       error: result.error || null,
       timestamp: new Date().toISOString(),
@@ -118,7 +121,7 @@ router.post('/anonymise', async (req, res) => {
       anonymisedResumes: anonymisedData.map(r => ({
         originalId: r.originalId,
         status: r.status,
-        fieldsRemoved: r.removedFields?.length || 0,
+        fieldsRemoved: r.removedCount || 0,
         error: r.error,
       })),
     });

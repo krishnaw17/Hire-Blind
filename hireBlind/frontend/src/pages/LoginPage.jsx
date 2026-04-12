@@ -2,8 +2,8 @@
 import React, { useState } from 'react';
 import {
   getAuth,
-  createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
+  signInWithCustomToken,
 } from 'firebase/auth';
 
 export default function LoginPage() {
@@ -22,28 +22,28 @@ export default function LoginPage() {
 
     try {
       if (isRegistering) {
-        // Register new user
-        await createUserWithEmailAndPassword(auth, email, password);
-
-        // Call backend to set role
-        const user = auth.currentUser;
-        const idToken = await user.getIdToken();
-
+        // Let the backend create the user AND set the role in Firestore first,
+        // then sign in with the custom token it returns. This avoids the race
+        // condition where onAuthStateChanged fires before the role is stored.
         const response = await fetch(
           `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/auth/register`,
           {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${idToken}`,
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ email, password, role }),
           }
         );
 
         if (!response.ok) {
-          throw new Error('Failed to set role');
+          const errorData = await response.json();
+          throw new Error(errorData.error || 'Registration failed');
         }
+
+        const data = await response.json();
+
+        // Sign in with the custom token so onAuthStateChanged fires
+        // AFTER the role doc is already in Firestore
+        await signInWithCustomToken(auth, data.token);
       } else {
         // Login existing user
         await signInWithEmailAndPassword(auth, email, password);
