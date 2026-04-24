@@ -5,6 +5,7 @@ import ResumeUpload from '../components/ResumeUpload';
 export default function AdminDashboard({ user, getToken, logout }) {
   const [jobTitle, setJobTitle] = useState('');
   const [jobDescription, setJobDescription] = useState('');
+  const [recruiterEmail, setRecruiterEmail] = useState('');
   const [sessionId, setSessionId] = useState(null);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
@@ -32,6 +33,7 @@ export default function AdminDashboard({ user, getToken, logout }) {
           body: JSON.stringify({
             jobTitle,
             jobDescription,
+            recruiterEmail,
           }),
         }
       );
@@ -144,6 +146,16 @@ export default function AdminDashboard({ user, getToken, logout }) {
               value={jobTitle}
               onChange={(e) => setJobTitle(e.target.value)}
               placeholder="e.g., Senior Software Engineer"
+            />
+          </div>
+
+          <div className="form-group">
+            <label>Recruiter Email (Optional)</label>
+            <input
+              type="email"
+              value={recruiterEmail}
+              onChange={(e) => setRecruiterEmail(e.target.value)}
+              placeholder="recruiter@hireblind.com"
             />
           </div>
 

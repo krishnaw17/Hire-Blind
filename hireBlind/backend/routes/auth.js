@@ -3,6 +3,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../config/db');
 const { authenticateToken, requireAdmin, signToken } = require('../middleware/auth');
+const { sendSessionEmail } = require('../utils/emailService');
 const router = express.Router();
 
 const SALT_ROUNDS = 10;
@@ -158,7 +159,7 @@ router.get('/verify', authenticateToken, async (req, res) => {
  */
 router.post('/set-job-description', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { jobDescription, jobTitle, screeningSessionId } = req.body;
+    const { jobDescription, jobTitle, screeningSessionId, recruiterEmail } = req.body;
 
     if (!jobDescription || !jobTitle) {
       return res.status(400).json({ error: 'Job title and description required' });
@@ -176,6 +177,11 @@ router.post('/set-job-description', authenticateToken, requireAdmin, async (req,
          updated_at = NOW()`,
       [sessionId, req.user.id, jobTitle, jobDescription]
     );
+
+    // Send email to recruiter if provided
+    if (recruiterEmail) {
+      await sendSessionEmail(recruiterEmail, jobTitle, sessionId);
+    }
 
     res.json({
       sessionId,
