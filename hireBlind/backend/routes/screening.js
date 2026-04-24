@@ -1,13 +1,10 @@
 // backend/routes/screening.js
 const express = require('express');
-const { getAuth } = require('firebase-admin/auth');
-const { getFirestore } = require('firebase-admin/firestore');
+const db = require('../config/db');
+const { authenticateToken } = require('../middleware/auth');
 const { stripPIIBatch } = require('../services/piiService');
 const { scoreCandidatesBatch } = require('../services/scoringService');
 const router = express.Router();
-
-const auth = getAuth();
-const db = getFirestore();
 
 /**
  * Helper: Validate session ID
@@ -23,17 +20,9 @@ function validateSessionId(sessionId) {
  * POST /api/screening/anonymise
  * Strip PII from all resumes in a session
  */
-router.post('/anonymise', async (req, res) => {
+router.post('/anonymise', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const decodedToken = await auth.verifyIdToken(token);
-    
-    // FIXED: Validate sessionId properly
+    // Validate sessionId
     let sessionId;
     try {
       sessionId = validateSessionId(req.body.sessionId);
@@ -42,17 +31,16 @@ router.post('/anonymise', async (req, res) => {
     }
 
     // Get session
-    const sessionDoc = await db
-      .collection('screeningSessions')
-      .doc(sessionId)
-      .get();
+    const sessionResult = await db.query(
+      'SELECT resumes FROM screening_sessions WHERE id = $1',
+      [sessionId]
+    );
 
-    if (!sessionDoc.exists) {
+    if (sessionResult.rows.length === 0) {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    const sessionData = sessionDoc.data();
-    const resumes = sessionData.resumes || [];
+    const resumes = sessionResult.rows[0].resumes || [];
 
     if (resumes.length === 0) {
       return res.status(400).json({ error: 'No resumes in session' });
@@ -60,12 +48,10 @@ router.post('/anonymise', async (req, res) => {
 
     // Strip PII from all resumes
     const anonymisedResults = await stripPIIBatch(
-      resumes.map(r => ({ id: r.id, text: r.text }))
+      resumes.map((r) => ({ id: r.id, text: r.text }))
     );
 
-    // Store anonymised resumes
-    // NOTE: Firestore rejects arrays nested inside arrays, so we
-    // stringify removedFields and store the count as a flat number.
+    // Build anonymised data
     const anonymisedData = anonymisedResults.map((result, index) => ({
       originalId: result.resumeId || `resume_${index}`,
       anonymisedText: result.anonymisedText || '',
@@ -76,49 +62,43 @@ router.post('/anonymise', async (req, res) => {
       timestamp: new Date().toISOString(),
     }));
 
-    // FIXED: Validate update object before sending
     if (!Array.isArray(anonymisedData) || anonymisedData.length === 0) {
-      return res.status(500).json({ 
-        error: 'Failed to process resumes: no valid data to store' 
+      return res.status(500).json({
+        error: 'Failed to process resumes: no valid data to store',
       });
     }
 
-    try {
-      await db
-        .collection('screeningSessions')
-        .doc(sessionId)
-        .update({ 
-          anonymisedResumes: anonymisedData,
-          lastUpdated: new Date().toISOString()
-        });
-    } catch (updateError) {
-      console.error('Firestore update error:', updateError);
-      return res.status(500).json({ 
-        error: `Database error: ${updateError.message}`,
-        details: 'Failed to store anonymised resumes'
-      });
-    }
+    // Update session with anonymised resumes
+    await db.query(
+      `UPDATE screening_sessions
+       SET anonymised_resumes = $1::jsonb, updated_at = NOW()
+       WHERE id = $2`,
+      [JSON.stringify(anonymisedData), sessionId]
+    );
 
     // Log audit event
-    await db.collection('auditLog').add({
-      action: 'pii_anonymisation',
-      userId: decodedToken.uid,
-      sessionId,
-      resumesProcessed: anonymisedResults.length,
-      timestamp: new Date().toISOString(),
-      details: {
-        totalRemoved: anonymisedResults.reduce(
-          (sum, r) => sum + (r.removedFields?.length || 0),
-          0
-        ),
-      },
-    });
+    await db.query(
+      `INSERT INTO audit_log (action, user_id, session_id, details, timestamp)
+       VALUES ($1, $2, $3, $4::jsonb, NOW())`,
+      [
+        'pii_anonymisation',
+        req.user.id,
+        sessionId,
+        JSON.stringify({
+          resumesProcessed: anonymisedResults.length,
+          totalRemoved: anonymisedResults.reduce(
+            (sum, r) => sum + (r.removedFields?.length || 0),
+            0
+          ),
+        }),
+      ]
+    );
 
     res.json({
       sessionId,
       totalProcessed: anonymisedResults.length,
-      successCount: anonymisedResults.filter(r => r.status === 'success').length,
-      anonymisedResumes: anonymisedData.map(r => ({
+      successCount: anonymisedResults.filter((r) => r.status === 'success').length,
+      anonymisedResumes: anonymisedData.map((r) => ({
         originalId: r.originalId,
         status: r.status,
         fieldsRemoved: r.removedCount || 0,
@@ -135,17 +115,9 @@ router.post('/anonymise', async (req, res) => {
  * POST /api/screening/score
  * Score anonymised candidates against job description
  */
-router.post('/score', async (req, res) => {
+router.post('/score', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const decodedToken = await auth.verifyIdToken(token);
-    
-    // FIXED: Validate sessionId
+    // Validate sessionId
     let sessionId;
     try {
       sessionId = validateSessionId(req.body.sessionId);
@@ -154,19 +126,19 @@ router.post('/score', async (req, res) => {
     }
 
     // Get session
-    const sessionDoc = await db
-      .collection('screeningSessions')
-      .doc(sessionId)
-      .get();
+    const sessionResult = await db.query(
+      'SELECT job_description, job_title, anonymised_resumes FROM screening_sessions WHERE id = $1',
+      [sessionId]
+    );
 
-    if (!sessionDoc.exists) {
+    if (sessionResult.rows.length === 0) {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    const sessionData = sessionDoc.data();
-    const jobDescription = sessionData.jobDescription;
-    const jobTitle = sessionData.jobTitle;
-    const anonymisedResumes = sessionData.anonymisedResumes || [];
+    const session = sessionResult.rows[0];
+    const jobDescription = session.job_description;
+    const jobTitle = session.job_title;
+    const anonymisedResumes = session.anonymised_resumes || [];
 
     if (!jobDescription) {
       return res.status(400).json({
@@ -183,14 +155,14 @@ router.post('/score', async (req, res) => {
     // Score all candidates
     const scoredCandidates = await scoreCandidatesBatch(
       jobDescription,
-      anonymisedResumes.map(r => ({
+      anonymisedResumes.map((r) => ({
         id: r.originalId,
         anonymisedText: r.anonymisedText,
       })),
       jobTitle
     );
 
-    // Store scores
+    // Build scored data
     const scoredData = scoredCandidates.map((result, rank) => ({
       rank: rank + 1,
       candidateId: result.candidateId,
@@ -204,32 +176,29 @@ router.post('/score', async (req, res) => {
       error: result.error || null,
     }));
 
-    try {
-      await db
-        .collection('screeningSessions')
-        .doc(sessionId)
-        .update({ 
-          scoredCandidates: scoredData,
-          lastUpdated: new Date().toISOString()
-        });
-    } catch (updateError) {
-      console.error('Firestore update error:', updateError);
-      return res.status(500).json({ 
-        error: `Database error: ${updateError.message}`,
-        details: 'Failed to store scored candidates'
-      });
-    }
+    // Update session with scored candidates
+    await db.query(
+      `UPDATE screening_sessions
+       SET scored_candidates = $1::jsonb, updated_at = NOW()
+       WHERE id = $2`,
+      [JSON.stringify(scoredData), sessionId]
+    );
 
     // Log audit event
-    await db.collection('auditLog').add({
-      action: 'candidates_scored',
-      userId: decodedToken.uid,
-      sessionId,
-      candidatesScored: scoredCandidates.length,
-      topCandidate: scoredCandidates[0]?.candidateId,
-      topScore: scoredCandidates[0]?.score,
-      timestamp: new Date().toISOString(),
-    });
+    await db.query(
+      `INSERT INTO audit_log (action, user_id, session_id, details, timestamp)
+       VALUES ($1, $2, $3, $4::jsonb, NOW())`,
+      [
+        'candidates_scored',
+        req.user.id,
+        sessionId,
+        JSON.stringify({
+          candidatesScored: scoredCandidates.length,
+          topCandidate: scoredCandidates[0]?.candidateId,
+          topScore: scoredCandidates[0]?.score,
+        }),
+      ]
+    );
 
     // Return top 5
     const topFive = scoredData.slice(0, 5);
@@ -250,17 +219,9 @@ router.post('/score', async (req, res) => {
  * POST /api/screening/override
  * Log manual ranking override
  */
-router.post('/override', async (req, res) => {
+router.post('/override', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const decodedToken = await auth.verifyIdToken(token);
-    
-    // FIXED: Validate sessionId
+    // Validate sessionId
     let sessionId;
     try {
       sessionId = validateSessionId(req.body.sessionId);
@@ -277,16 +238,21 @@ router.post('/override', async (req, res) => {
     }
 
     // Log override
-    await db.collection('auditLog').add({
-      action: 'ranking_override',
-      userId: decodedToken.uid,
-      sessionId,
-      candidateId,
-      newRank: newRank || null,
-      reason,
-      timestamp: new Date().toISOString(),
-      flagged: true,
-    });
+    await db.query(
+      `INSERT INTO audit_log (action, user_id, session_id, details, timestamp)
+       VALUES ($1, $2, $3, $4::jsonb, NOW())`,
+      [
+        'ranking_override',
+        req.user.id,
+        sessionId,
+        JSON.stringify({
+          candidateId,
+          newRank: newRank || null,
+          reason,
+          flagged: true,
+        }),
+      ]
+    );
 
     res.json({
       success: true,
@@ -303,17 +269,9 @@ router.post('/override', async (req, res) => {
  * GET /api/screening/:sessionId
  * Get all screening results for a session
  */
-router.get('/:sessionId', async (req, res) => {
+router.get('/:sessionId', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    await auth.verifyIdToken(token);
-
-    // FIXED: Validate sessionId
+    // Validate sessionId
     let sessionId;
     try {
       sessionId = validateSessionId(req.params.sessionId);
@@ -321,26 +279,30 @@ router.get('/:sessionId', async (req, res) => {
       return res.status(400).json({ error: validationError.message });
     }
 
-    const sessionDoc = await db
-      .collection('screeningSessions')
-      .doc(sessionId)
-      .get();
+    const result = await db.query(
+      `SELECT job_title, job_description, resumes,
+              anonymised_resumes, scored_candidates, created_at
+       FROM screening_sessions WHERE id = $1`,
+      [sessionId]
+    );
 
-    if (!sessionDoc.exists) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    const sessionData = sessionDoc.data();
+    const session = result.rows[0];
 
     res.json({
       sessionId,
-      jobTitle: sessionData.jobTitle,
-      jobDescription: sessionData.jobDescription?.substring(0, 200) + '...',
-      totalResumes: sessionData.resumes?.length || 0,
-      anonymisedCount: sessionData.anonymisedResumes?.length || 0,
-      scoredCount: sessionData.scoredCandidates?.length || 0,
-      topCandidates: (sessionData.scoredCandidates || []).slice(0, 5),
-      createdAt: sessionData.createdAt,
+      jobTitle: session.job_title,
+      jobDescription: session.job_description
+        ? session.job_description.substring(0, 200) + '...'
+        : '',
+      totalResumes: (session.resumes || []).length,
+      anonymisedCount: (session.anonymised_resumes || []).length,
+      scoredCount: (session.scored_candidates || []).length,
+      topCandidates: (session.scored_candidates || []).slice(0, 5),
+      createdAt: session.created_at,
     });
   } catch (error) {
     console.error('Get screening error:', error);

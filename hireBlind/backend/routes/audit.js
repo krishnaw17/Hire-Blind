@@ -1,47 +1,38 @@
 // backend/routes/audit.js
 const express = require('express');
-const { getAuth } = require('firebase-admin/auth');
-const { getFirestore } = require('firebase-admin/firestore');
+const db = require('../config/db');
+const { authenticateToken } = require('../middleware/auth');
 const router = express.Router();
-
-const auth = getAuth();
-const db = getFirestore();
 
 /**
  * GET /api/audit/log
  * Get audit log for a session
  */
-router.get('/log', async (req, res) => {
+router.get('/log', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    await auth.verifyIdToken(token);
-
     const { sessionId } = req.query;
 
     if (!sessionId) {
       return res.status(400).json({ error: 'Session ID required' });
     }
 
-    const logsSnapshot = await db
-      .collection('auditLog')
-      .where('sessionId', '==', sessionId)
-      .get();
+    const result = await db.query(
+      `SELECT id, action, user_id, session_id, details, timestamp
+       FROM audit_log
+       WHERE session_id = $1
+       ORDER BY timestamp DESC`,
+      [sessionId]
+    );
 
-    const logs = [];
-    logsSnapshot.forEach(doc => {
-      logs.push({
-        id: doc.id,
-        ...doc.data(),
-      });
-    });
-
-    // Sort in memory to avoid Firestore composite index requirement
-    logs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    // Flatten details into each log entry for frontend compatibility
+    const logs = result.rows.map((row) => ({
+      id: row.id,
+      action: row.action,
+      userId: row.user_id,
+      sessionId: row.session_id,
+      timestamp: row.timestamp,
+      ...row.details, // Spread JSONB details (count, resumesProcessed, reason, etc.)
+    }));
 
     res.json({
       sessionId,
@@ -58,16 +49,8 @@ router.get('/log', async (req, res) => {
  * GET /api/audit/compliance-report
  * Generate EU AI Act compliance report
  */
-router.get('/compliance-report', async (req, res) => {
+router.get('/compliance-report', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const decodedToken = await auth.verifyIdToken(token);
-
     const { sessionId } = req.query;
 
     if (!sessionId) {
@@ -75,57 +58,68 @@ router.get('/compliance-report', async (req, res) => {
     }
 
     // Get session data
-    const sessionDoc = await db
-      .collection('screeningSessions')
-      .doc(sessionId)
-      .get();
+    const sessionResult = await db.query(
+      `SELECT job_title, job_description, resumes,
+              anonymised_resumes, scored_candidates, created_at
+       FROM screening_sessions WHERE id = $1`,
+      [sessionId]
+    );
 
-    if (!sessionDoc.exists) {
+    if (sessionResult.rows.length === 0) {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    const sessionData = sessionDoc.data();
+    const session = sessionResult.rows[0];
 
-    // Get audit logs
-    const logsSnapshot = await db
-      .collection('auditLog')
-      .where('sessionId', '==', sessionId)
-      .get();
+    // Get audit logs for this session
+    const logsResult = await db.query(
+      `SELECT action, user_id, details, timestamp
+       FROM audit_log
+       WHERE session_id = $1
+       ORDER BY timestamp DESC`,
+      [sessionId]
+    );
 
-    const logs = [];
-    logsSnapshot.forEach(doc => {
-      logs.push(doc.data());
-    });
+    const logs = logsResult.rows.map((row) => ({
+      action: row.action,
+      userId: row.user_id,
+      timestamp: row.timestamp,
+      details: row.details,
+      ...row.details,
+    }));
 
     // Calculate PII removal statistics
-    const anonymisationLog = logs.find(l => l.action === 'pii_anonymisation');
+    const anonymisationLog = logs.find((l) => l.action === 'pii_anonymisation');
     const totalFieldsRemoved = anonymisationLog?.details?.totalRemoved || 0;
-    const totalResumes = sessionData.resumes?.length || 0;
+    const totalResumes = (session.resumes || []).length;
 
     // Count overrides
-    const overrides = logs.filter(l => l.action === 'ranking_override');
+    const overrides = logs.filter(
+      (l) => l.action === 'ranking_override' || l.action === 'ranking_override_flagged'
+    );
 
     // Build compliance report
     const report = {
       reportId: `REPORT-${Date.now()}`,
       sessionId,
       generatedAt: new Date().toISOString(),
-      generatedBy: decodedToken.uid,
-      
+      generatedBy: req.user.id,
+
       // Article 13: Transparency
       transparency: {
         title: 'EU AI Act Article 13 - Transparency Report',
-        jobTitle: sessionData.jobTitle,
+        jobTitle: session.job_title,
         totalCandidates: totalResumes,
-        processedCandidates: sessionData.anonymisedResumes?.length || 0,
-        scoredCandidates: sessionData.scoredCandidates?.length || 0,
+        processedCandidates: (session.anonymised_resumes || []).length,
+        scoredCandidates: (session.scored_candidates || []).length,
       },
 
       // Data Processing
       dataProcessing: {
         piiRemovalSummary: {
           totalFieldsRemoved,
-          averagePerResume: totalResumes > 0 ? (totalFieldsRemoved / totalResumes).toFixed(1) : 0,
+          averagePerResume:
+            totalResumes > 0 ? (totalFieldsRemoved / totalResumes).toFixed(1) : 0,
           fieldsRemovedTypes: [
             'Full name',
             'Email address',
@@ -144,9 +138,9 @@ router.get('/compliance-report', async (req, res) => {
         decision: 'All final hiring decisions made by recruiter',
         noFullyAutomatedDecisions: true,
         manualOverridesApplied: overrides.length,
-        overrideReasons: overrides.map(o => ({
-          candidateId: o.candidateId,
-          reason: o.reason,
+        overrideReasons: overrides.map((o) => ({
+          candidateId: o.details?.candidateId || o.candidateId,
+          reason: o.details?.reason || o.reason,
           timestamp: o.timestamp,
         })),
       },
@@ -163,7 +157,7 @@ router.get('/compliance-report', async (req, res) => {
       // Audit Trail
       auditTrail: {
         totalEvents: logs.length,
-        events: logs.slice(0, 10).map(l => ({
+        events: logs.slice(0, 10).map((l) => ({
           action: l.action,
           timestamp: l.timestamp,
           details: l.details,
@@ -196,15 +190,8 @@ router.get('/compliance-report', async (req, res) => {
  * POST /api/audit/override-flag
  * Flag and log a ranking override (for bias detection)
  */
-router.post('/override-flag', async (req, res) => {
+router.post('/override-flag', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const decodedToken = await auth.verifyIdToken(token);
     const { sessionId, candidateId, originalRank, newRank, reason } = req.body;
 
     if (!sessionId || !candidateId || !reason) {
@@ -213,21 +200,24 @@ router.post('/override-flag', async (req, res) => {
       });
     }
 
-    // Log the override
-    const flagLog = {
-      action: 'ranking_override_flagged',
-      userId: decodedToken.uid,
-      sessionId,
-      candidateId,
-      originalRank,
-      newRank,
-      reason,
-      timestamp: new Date().toISOString(),
-      severity: 'medium',
-      requiresReview: true,
-    };
-
-    await db.collection('auditLog').add(flagLog);
+    // Log the override flag
+    await db.query(
+      `INSERT INTO audit_log (action, user_id, session_id, details, timestamp)
+       VALUES ($1, $2, $3, $4::jsonb, NOW())`,
+      [
+        'ranking_override_flagged',
+        req.user.id,
+        sessionId,
+        JSON.stringify({
+          candidateId,
+          originalRank,
+          newRank,
+          reason,
+          severity: 'medium',
+          requiresReview: true,
+        }),
+      ]
+    );
 
     res.json({
       success: true,
@@ -246,38 +236,31 @@ router.post('/override-flag', async (req, res) => {
  * GET /api/audit/flags
  * Get all flagged overrides for a session
  */
-router.get('/flags', async (req, res) => {
+router.get('/flags', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    await auth.verifyIdToken(token);
-
     const { sessionId } = req.query;
 
     if (!sessionId) {
       return res.status(400).json({ error: 'Session ID required' });
     }
 
-    const flagsSnapshot = await db
-      .collection('auditLog')
-      .where('sessionId', '==', sessionId)
-      .where('requiresReview', '==', true)
-      .get();
+    const result = await db.query(
+      `SELECT id, action, user_id, session_id, details, timestamp
+       FROM audit_log
+       WHERE session_id = $1
+         AND (details->>'requiresReview')::boolean = true
+       ORDER BY timestamp DESC`,
+      [sessionId]
+    );
 
-    const flags = [];
-    flagsSnapshot.forEach(doc => {
-      flags.push({
-        id: doc.id,
-        ...doc.data(),
-      });
-    });
-
-    // Sort in memory to avoid Firestore composite index requirement
-    flags.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    const flags = result.rows.map((row) => ({
+      id: row.id,
+      action: row.action,
+      userId: row.user_id,
+      sessionId: row.session_id,
+      timestamp: row.timestamp,
+      ...row.details,
+    }));
 
     res.json({
       sessionId,

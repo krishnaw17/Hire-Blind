@@ -4,7 +4,7 @@ import CandidateRanking from '../components/CandidateRanking';
 import CompliancePanel from '../components/CompliancePanel';
 import AuditLog from '../components/AuditLog';
 
-export default function RecruiterDashboard({ user, getToken, auth }) {
+export default function RecruiterDashboard({ user, getToken, logout }) {
   const [sessionId, setSessionId] = useState('');
   const [screening, setScreening] = useState(null);
   const [topCandidates, setTopCandidates] = useState([]);
@@ -49,7 +49,7 @@ export default function RecruiterDashboard({ user, getToken, auth }) {
         <h1>👤 Recruiter Dashboard</h1>
         <div className="user-info">
           <span>{user.email}</span>
-          <button onClick={() => auth.signOut()}>Sign Out</button>
+          <button onClick={logout}>Sign Out</button>
         </div>
       </header>
 

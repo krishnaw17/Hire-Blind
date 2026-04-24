@@ -1,19 +1,15 @@
 // frontend/src/pages/LoginPage.jsx
 import React, { useState } from 'react';
-import {
-  getAuth,
-  signInWithEmailAndPassword,
-  signInWithCustomToken,
-} from 'firebase/auth';
 
-export default function LoginPage() {
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+
+export default function LoginPage({ onAuthSuccess }) {
   const [isRegistering, setIsRegistering] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [role, setRole] = useState('recruiter');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const auth = getAuth();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -21,33 +17,25 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      if (isRegistering) {
-        // Let the backend create the user AND set the role in Firestore first,
-        // then sign in with the custom token it returns. This avoids the race
-        // condition where onAuthStateChanged fires before the role is stored.
-        const response = await fetch(
-          `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/auth/register`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email, password, role }),
-          }
-        );
+      const endpoint = isRegistering ? '/api/auth/register' : '/api/auth/login';
+      const body = isRegistering
+        ? { email, password, role }
+        : { email, password };
 
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || 'Registration failed');
-        }
+      const response = await fetch(`${API_URL}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
 
-        const data = await response.json();
+      const data = await response.json();
 
-        // Sign in with the custom token so onAuthStateChanged fires
-        // AFTER the role doc is already in Firestore
-        await signInWithCustomToken(auth, data.token);
-      } else {
-        // Login existing user
-        await signInWithEmailAndPassword(auth, email, password);
+      if (!response.ok) {
+        throw new Error(data.error || 'Authentication failed');
       }
+
+      // Pass user data + token to parent
+      onAuthSuccess(data);
     } catch (err) {
       setError(err.message);
     } finally {

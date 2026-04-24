@@ -2,7 +2,7 @@
 import React, { useState, useRef } from 'react';
 import ResumeUpload from '../components/ResumeUpload';
 
-export default function AdminDashboard({ user, getToken, auth }) {
+export default function AdminDashboard({ user, getToken, logout }) {
   const [jobTitle, setJobTitle] = useState('');
   const [jobDescription, setJobDescription] = useState('');
   const [sessionId, setSessionId] = useState(null);
@@ -130,7 +130,7 @@ export default function AdminDashboard({ user, getToken, auth }) {
         <h1>🧑‍💼 Admin Dashboard</h1>
         <div className="user-info">
           <span>{user.email}</span>
-          <button onClick={() => auth.signOut()}>Sign Out</button>
+          <button onClick={logout}>Sign Out</button>
         </div>
       </header>
 

@@ -302,7 +302,7 @@ textarea {
   align-items: center;
   justify-content: center;
   min-height: 100vh;
-  background: linear-gradient(135deg, var(--primary), #1e40af);
+  background: linear-gradient(135deg, var(--primary), #a46c6c);
   padding: var(--spacing-lg);
 }
 

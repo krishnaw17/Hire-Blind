@@ -1,11 +1,11 @@
 // backend/routes/auth.js
 const express = require('express');
-const { getAuth } = require('firebase-admin/auth');
-const { getFirestore } = require('firebase-admin/firestore');
+const bcrypt = require('bcryptjs');
+const db = require('../config/db');
+const { authenticateToken, requireAdmin, signToken } = require('../middleware/auth');
 const router = express.Router();
 
-const auth = getAuth();
-const db = getFirestore();
+const SALT_ROUNDS = 10;
 
 /**
  * POST /api/auth/register
@@ -17,38 +17,53 @@ router.post('/register', async (req, res) => {
 
     if (!email || !password || !role) {
       return res.status(400).json({
-        error: 'Email, password, and role required'
+        error: 'Email, password, and role required',
       });
     }
 
     if (!['admin', 'recruiter'].includes(role)) {
       return res.status(400).json({
-        error: 'Role must be "admin" or "recruiter"'
+        error: 'Role must be "admin" or "recruiter"',
       });
     }
 
-    // Create Firebase user
-    const userRecord = await auth.createUser({
-      email,
-      password,
-    });
+    if (password.length < 6) {
+      return res.status(400).json({
+        error: 'Password must be at least 6 characters',
+      });
+    }
 
-    // Store role in Firestore
-    await db.collection('users').doc(userRecord.uid).set({
-      email,
-      role,
-      createdAt: new Date().toISOString(),
-    });
+    // Check if email already exists
+    const existing = await db.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'Email already registered' });
+    }
 
-    // Create custom token for immediate login
-    const customToken = await auth.createCustomToken(userRecord.uid);
+    // Hash password and insert user
+    const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+
+    const result = await db.query(
+      `INSERT INTO users (email, password_hash, role)
+       VALUES ($1, $2, $3)
+       RETURNING id, email, role, created_at`,
+      [email, passwordHash, role]
+    );
+
+    const user = result.rows[0];
+
+    // Sign JWT for immediate login
+    const token = signToken({
+      id: user.id,
+      email: user.email,
+      role: user.role,
+    });
 
     res.status(201).json({
-      uid: userRecord.uid,
-      email,
-      role,
-      token: customToken,
-      message: 'User created successfully'
+      uid: user.id,
+      email: user.email,
+      role: user.role,
+      token,
+      message: 'User created successfully',
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -58,9 +73,7 @@ router.post('/register', async (req, res) => {
 
 /**
  * POST /api/auth/login
- * Login user and return JWT
- * Note: Client will use Firebase SDK's signInWithEmailAndPassword
- * This endpoint is for reference
+ * Authenticate user and return JWT
  */
 router.post('/login', async (req, res) => {
   try {
@@ -68,28 +81,41 @@ router.post('/login', async (req, res) => {
 
     if (!email || !password) {
       return res.status(400).json({
-        error: 'Email and password required'
+        error: 'Email and password required',
       });
     }
 
-    // Get user by email to retrieve role
-    const userQuery = await db
-      .collection('users')
-      .where('email', '==', email)
-      .get();
+    // Find user by email
+    const result = await db.query(
+      'SELECT id, email, password_hash, role FROM users WHERE email = $1',
+      [email]
+    );
 
-    if (userQuery.empty) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const userDoc = userQuery.docs[0];
-    const userData = userDoc.data();
+    const user = result.rows[0];
+
+    // Compare password
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // Sign JWT
+    const token = signToken({
+      id: user.id,
+      email: user.email,
+      role: user.role,
+    });
 
     res.json({
-      uid: userDoc.id,
-      email,
-      role: userData.role,
-      message: 'Login successful. Use Firebase SDK for actual authentication.'
+      uid: user.id,
+      email: user.email,
+      role: user.role,
+      token,
+      message: 'Login successful',
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -99,59 +125,26 @@ router.post('/login', async (req, res) => {
 
 /**
  * GET /api/auth/verify
- * Verify JWT token and get user role
- * Auto-creates user doc if missing
+ * Verify JWT token and return user info
  */
-router.get('/verify', async (req, res) => {
+router.get('/verify', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
+    // Token already verified by middleware, fetch fresh user data
+    const result = await db.query(
+      'SELECT id, email, role FROM users WHERE id = $1',
+      [req.user.id]
+    );
 
-    if (!token) {
-      return res.status(401).json({ error: 'No token provided' });
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'User not found' });
     }
 
-    const decodedToken = await auth.verifyIdToken(token);
-
-    // Hardcoded admin emails — only used as fallback when no Firestore doc exists
-    const adminEmails = ['admin@hireblind.com', 'krishnawadhwa2@gmail.com'];
-
-    let role = null;
-
-    // Firestore is the single source of truth for roles
-    try {
-      const userDocRef = db.collection('users').doc(decodedToken.uid);
-      const userDoc = await userDocRef.get();
-      const userData = userDoc.data();
-
-      if (userData) {
-        role = userData.role;
-
-        // Auto-correct hardcoded admin emails if stored with wrong role
-        if (adminEmails.includes(decodedToken.email) && role !== 'admin') {
-          role = 'admin';
-          await userDocRef.update({ role: 'admin' });
-          console.log(`Corrected role to admin for ${decodedToken.email}`);
-        }
-      } else {
-        // No doc yet — auto-create with email-based fallback
-        role = adminEmails.includes(decodedToken.email) ? 'admin' : 'recruiter';
-        await userDocRef.set({
-          email: decodedToken.email,
-          role,
-          createdAt: new Date().toISOString(),
-        });
-        console.log(`Auto-created user doc for ${decodedToken.email} with role: ${role}`);
-      }
-    } catch (firestoreError) {
-      // Firestore unavailable — fall back to email-based role
-      role = adminEmails.includes(decodedToken.email) ? 'admin' : 'recruiter';
-      console.warn('Firestore unavailable, using email-based role:', firestoreError.message);
-    }
+    const user = result.rows[0];
 
     res.json({
-      uid: decodedToken.uid,
-      email: decodedToken.email,
-      role,
+      uid: user.id,
+      email: user.email,
+      role: user.role,
     });
   } catch (error) {
     console.error('Verification error:', error);
@@ -163,36 +156,30 @@ router.get('/verify', async (req, res) => {
  * POST /api/auth/set-job-description
  * Admin uploads job description
  */
-router.post('/set-job-description', async (req, res) => {
+router.post('/set-job-description', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { jobDescription, jobTitle, screeningSessionId } = req.body;
-    const token = req.headers.authorization?.split('Bearer ')[1];
 
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const decodedToken = await auth.verifyIdToken(token);
-    const userDoc = await db.collection('users').doc(decodedToken.uid).get();
-    const userData = userDoc.data();
-
-    if (userData?.role !== 'admin') {
-      return res.status(403).json({ error: 'Only admin can set job description' });
+    if (!jobDescription || !jobTitle) {
+      return res.status(400).json({ error: 'Job title and description required' });
     }
 
     const sessionId = screeningSessionId || Date.now().toString();
 
-    await db.collection('screeningSessions').doc(sessionId).set({
-      adminId: decodedToken.uid,
-      jobTitle,
-      jobDescription,
-      createdAt: new Date().toISOString(),
-      status: 'active',
-    });
+    // Upsert the screening session
+    await db.query(
+      `INSERT INTO screening_sessions (id, admin_id, job_title, job_description, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'active', NOW(), NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         job_title = $3,
+         job_description = $4,
+         updated_at = NOW()`,
+      [sessionId, req.user.id, jobTitle, jobDescription]
+    );
 
     res.json({
       sessionId,
-      message: 'Job description saved'
+      message: 'Job description saved',
     });
   } catch (error) {
     console.error('Job description error:', error);

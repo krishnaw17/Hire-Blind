@@ -1,70 +1,75 @@
 // frontend/src/App.jsx
 import React, { useState, useEffect } from 'react';
-import { getAuth, onAuthStateChanged } from 'firebase/auth';
-import { initializeApp } from 'firebase/app';
 import LoginPage from './pages/LoginPage';
 import AdminDashboard from './pages/AdminDashboard';
 import RecruiterDashboard from './pages/RecruiterDashboard';
 import './styles/globals.css';
 
-// Firebase config (replace with your config)
-const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-  appId: import.meta.env.VITE_FIREBASE_APP_ID,
-};
-
-const firebaseApp = initializeApp(firebaseConfig);
-const auth = getAuth(firebaseApp);
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 
 export default function App() {
   const [user, setUser] = useState(null);
   const [userRole, setUserRole] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  // Always returns a fresh (non-expired) Firebase ID token
+  // Returns the stored JWT token
   const getToken = async () => {
-    if (!auth.currentUser) throw new Error('Not authenticated');
-    return auth.currentUser.getIdToken(true);
+    const token = localStorage.getItem('hireblind_token');
+    if (!token) throw new Error('Not authenticated');
+    return token;
   };
 
+  // Verify token on mount and restore session
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      if (currentUser) {
-        setUser(currentUser);
+    const verifySession = async () => {
+      const token = localStorage.getItem('hireblind_token');
 
-        // Fetch user role from backend using a fresh token
-        try {
-          const token = await currentUser.getIdToken(true);
-          const response = await fetch(
-            `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/auth/verify`,
-            {
-              headers: { Authorization: `Bearer ${token}` },
-            }
-          );
-          if (response.ok) {
-            const data = await response.json();
-            setUserRole(data.role);
-          } else {
-            console.error('Verify endpoint returned:', response.status);
-            setUserRole(null);
-          }
-        } catch (error) {
-          console.error('Failed to fetch user role:', error);
+      if (!token) {
+        setLoading(false);
+        return;
+      }
+
+      try {
+        const response = await fetch(`${API_URL}/api/auth/verify`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          setUser({ uid: data.uid, email: data.email });
+          setUserRole(data.role);
+        } else {
+          // Token expired or invalid — clear it
+          localStorage.removeItem('hireblind_token');
+          setUser(null);
           setUserRole(null);
         }
-      } else {
+      } catch (error) {
+        console.error('Failed to verify session:', error);
+        localStorage.removeItem('hireblind_token');
         setUser(null);
         setUserRole(null);
       }
-      setLoading(false);
-    });
 
-    return unsubscribe;
+      setLoading(false);
+    };
+
+    verifySession();
   }, []);
+
+  // Called after successful login/register
+  const handleAuthSuccess = (userData) => {
+    localStorage.setItem('hireblind_token', userData.token);
+    setUser({ uid: userData.uid, email: userData.email });
+    setUserRole(userData.role);
+  };
+
+  // Logout handler
+  const logout = () => {
+    localStorage.removeItem('hireblind_token');
+    setUser(null);
+    setUserRole(null);
+  };
 
   if (loading) {
     return (
@@ -76,7 +81,7 @@ export default function App() {
   }
 
   if (!user) {
-    return <LoginPage />;
+    return <LoginPage onAuthSuccess={handleAuthSuccess} />;
   }
 
   // Role-based routing
@@ -85,7 +90,7 @@ export default function App() {
       <AdminDashboard
         user={user}
         getToken={getToken}
-        auth={auth}
+        logout={logout}
       />
     );
   }
@@ -95,7 +100,7 @@ export default function App() {
       <RecruiterDashboard
         user={user}
         getToken={getToken}
-        auth={auth}
+        logout={logout}
       />
     );
   }
@@ -104,9 +109,7 @@ export default function App() {
     <div className="error-container">
       <h2>Access Denied</h2>
       <p>Your role is not recognized. Please contact support.</p>
-      <button onClick={() => auth.signOut()}>Sign Out</button>
+      <button onClick={logout}>Sign Out</button>
     </div>
   );
 }
-
-export { auth };
